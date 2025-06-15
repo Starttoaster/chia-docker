@@ -4,8 +4,7 @@ set -e
 
 # shellcheck disable=SC2154
 if [[ -n "${TZ}" ]]; then
-  echo "Setting timezone to ${TZ}"
-  sudo ln -snf "/usr/share/zoneinfo/$TZ" /etc/localtime && echo "$TZ" | sudo tee /etc/timezone
+  echo "Timezone set to ${TZ}"
 fi
 
 # Ensure CHIA_ROOT directory exists and has correct ownership
@@ -304,8 +303,8 @@ if [ -z "${service##*timelord*}" ]; then
     echo "Installing timelord using install-timelord.sh"
 
     # install-timelord.sh relies on lsb-release for determining the cmake installation method, and git for building chiavdf
-    DEBIAN_FRONTEND=noninteractive apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y lsb-release git
+    DEBIAN_FRONTEND=noninteractive sudo apt-get update
+    DEBIAN_FRONTEND=noninteractive sudo apt-get install --no-install-recommends -y lsb-release git
 
     /bin/sh ./install-timelord.sh
 fi
