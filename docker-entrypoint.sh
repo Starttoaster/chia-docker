@@ -306,7 +306,7 @@ if [ -z "${service##*timelord*}" ]; then
     DEBIAN_FRONTEND=noninteractive sudo apt-get update
     DEBIAN_FRONTEND=noninteractive sudo apt-get install --no-install-recommends -y lsb-release git
 
-    /bin/sh ./install-timelord.sh
+    sudo /bin/sh ./install-timelord.sh
 fi
 
 # Map deprecated legacy startup options.
