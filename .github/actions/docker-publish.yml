@@ -1,0 +1,313 @@
+name: "Build Docker Image"
+description: "Builds a Docker image"
+inputs:
+  docker-platforms:
+    description: "The OS/arch platforms to pass to docker buildx"
+    required: false
+    default: "linux/amd64,linux/arm64"
+  docker-context:
+    description: "The docker build context directory"
+    required: false
+    default: .
+  dockerfile:
+    description: "The path to a Dockerfile"
+    required: false
+    default: "./Dockerfile"
+  image_subpath:
+    description: "Set this to a string sub-path to publish your image under"
+    required: false
+  build-args:
+    description: "Sets some docker build args"
+    required: false
+    default: ""
+  alternate-latest-mode:
+    description: "This creates a :latest tag on the default branch if set to true"
+    required: false
+    default: "false"
+  push:
+    description: "Whether or not to attempt to push the image to the registry"
+    required: false
+    default: "true"
+
+jobs:
+  # Translates docker-platforms input to runner tags
+  matrix:
+    name: Create job matrix
+    runs-on: ubuntu-latest
+    outputs:
+      stringify: ${{ steps.setup-matrix.outputs.stringify }}
+    steps:
+      - name: matrix / setup list
+        id: setup-matrix
+        uses: actions/github-script@v7.0.1
+        with:
+          script: |
+            const platforms = "${{ inputs.docker-platforms }}".split(",");
+            const matrix = {include:[]};
+            for(const platform of platforms){
+              switch(platform){
+                case "linux/amd64": matrix.include.push({platform:platform, runner:"ubuntu-latest"}); break;
+                case "linux/arm64": matrix.include.push({platform:platform, runner:"ubuntu-24.04-arm"}); break;
+              }
+            }
+            const stringify = JSON.stringify(matrix);
+            core.setOutput('stringify', stringify);
+            core.info(stringify);
+
+  # Build container image(s)
+  docker:
+    name: Build container image(s)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.stringify) }}
+    outputs:
+      DOCKER_IMAGE_NAME: ${{ steps.setup-environment.outputs.DOCKER_IMAGE_NAME }}
+      DOCKER_IMAGE_MERGE_TAGS: ${{ steps.setup-environment.outputs.DOCKER_IMAGE_MERGE_TAGS }}
+    permissions:
+      actions: read
+      packages: write
+      id-token: write
+    needs: matrix
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Set env
+        id: setup-environment
+        uses: actions/github-script@v7.0.1
+        with:
+          script: |
+            const { existsSync, readFileSync } = require('node:fs');
+            const { resolve } = require('node:path');
+            const { inspect } = require('node:util');
+            const { Buffer } = require('node:buffer');
+            const inputs = `${{ toJSON(github.event.inputs) }}`.
+              replace(/"platform":\s*"\[(.+)\]",/i, `"platform": [$1],`);
+            const opt = {input:{}, dot:{}};
+
+            try{
+              if(inputs.length > 0){
+                opt.input = JSON.parse(inputs);
+                if(opt.input?.etc){
+                  opt.input.etc = JSON.parse(Buffer.from(opt.input.etc, 'base64').toString('ascii'));
+                }
+              }
+            }catch(e){
+              core.warning('could not parse github.event.inputs');
+              core.warning(inputs);
+            }
+
+            try{
+              const path = resolve('.json');
+              if(existsSync(path)){
+                try{
+                  opt.dot = JSON.parse(readFileSync(path).toString());
+                }catch(e){
+                  throw new Error('could not parse .json');
+                }
+              }else{
+                throw new Error('.json does not exist');
+              }
+            }catch(e){
+              core.setFailed(e);
+            }
+
+            core.info(inspect(opt, {showHidden:false, depth:null, colors:true}));
+
+            const docker = {
+              image:{
+                name:opt.dot.image,
+                arch:(opt.input?.etc?.arch || opt.dot?.arch || 'linux/amd64,linux/arm64'),
+                prefix:((opt.input?.etc?.semverprefix) ? `${opt.input?.etc?.semverprefix}-` : ''),
+                suffix:((opt.input?.etc?.semversuffix) ? `-${opt.input?.etc?.semversuffix}` : ''),
+                description:(opt.dot?.readme?.description || ''),
+                platform:{
+                  sanitized:"${{ matrix.platform }}".replace(/[^A-Z-a-z0-9]+/i, ""),
+                },
+                tags:[],
+              },
+              app:{
+                image:opt.dot.image,
+                name:opt.dot.name,
+                version:(opt.input?.etc?.version || opt.dot?.semver?.version),
+                root:opt.dot.root,
+                UID:(opt.input?.etc?.uid || 1000),
+                GID:(opt.input?.etc?.gid || 1000),
+                no_cache:new Date().getTime(),
+              },
+              cache:{
+                registry:'localhost:5000/',
+              },
+              tags:[],
+              merge_tags:[],
+            };
+
+            docker.cache.name = `${docker.image.name}:${docker.image.prefix}buildcache${docker.image.suffix}`;
+            docker.app.prefix = docker.image.prefix;
+            docker.app.suffix = docker.image.suffix;
+
+            // setup tags
+            if(!opt.dot?.semver?.disable?.rolling && !opt.input.etc?.semver?.disable?.rolling){
+              docker.image.tags.push('rolling');
+            }
+            if(opt.input?.etc?.dockerfile !== 'arch.dockerfile' && opt.input?.etc?.tag){
+              docker.image.tags.push(opt.input.etc.tag);
+              docker.image.tags.push(`${opt.input.etc.tag}-${docker.app.version}`);
+              docker.cache.name = `${docker.image.name}:buildcache-${opt.input.etc.tag}`;
+            }else if(docker.app.version !== 'latest'){
+              const semver = docker.app.version.split('.');
+              if(Array.isArray(semver)){
+                if(semver.length >= 1) docker.image.tags.push(`${semver[0]}`);
+                if(semver.length >= 2) docker.image.tags.push(`${semver[0]}.${semver[1]}`);
+                if(semver.length >= 3) docker.image.tags.push(`${semver[0]}.${semver[1]}.${semver[2]}`);
+              }
+              if(opt.dot?.semver?.stable && new RegExp(opt.dot?.semver.stable, 'ig').test(docker.image.tags.join(','))) docker.image.tags.push('stable');
+              if(opt.dot?.semver?.latest && new RegExp(opt.dot?.semver.latest, 'ig').test(docker.image.tags.join(','))) docker.image.tags.push('latest');
+            }else{
+              docker.image.tags.push('latest');
+            }
+
+            for(const tag of docker.image.tags){
+              docker.tags.push(`ghcr.io/${docker.image.name}:${docker.image.prefix}${tag}${docker.image.suffix}-${docker.image.platform.sanitized}`);
+              docker.merge_tags.push(`${docker.image.prefix}${tag}${docker.image.suffix}`);
+            }
+
+            // DOCKER_IMAGE_NAME
+            core.exportVariable('DOCKER_IMAGE_NAME', docker.image.name);
+            core.setOutput('DOCKER_IMAGE_NAME', docker.image.name);
+
+            // DOCKER_IMAGE_TAGS
+            core.exportVariable('DOCKER_IMAGE_TAGS', docker.tags.join(','));
+
+            // DOCKER_IMAGE_MERGE_TAGS
+            core.exportVariable('DOCKER_IMAGE_MERGE_TAGS', docker.merge_tags.join("\r\n"));
+            core.setOutput('DOCKER_IMAGE_MERGE_TAGS', docker.merge_tags.join("\r\n"));
+
+            // DOCKER_IMAGE_PLATFORM_SANITIZED
+            core.exportVariable('DOCKER_IMAGE_PLATFORM_SANITIZED', docker.image.platform.sanitized);
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Setup buildx with local registry
+        uses: docker/setup-buildx-action@v3.11.1
+        with:
+          driver-opts: network=host
+
+      - name: Set image name
+        id: image
+        shell: bash
+        run: |
+          export subpath="${{ inputs.image_subpath }}"
+          if [ "$subpath" == '' ]; then
+            echo "imagename=ghcr.io/${{ github.repository }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "imagename=ghcr.io/${{ github.repository }}/${subpath}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ steps.image.outputs.imagename }}
+          flavor: |
+            latest=auto
+            prefix=
+            suffix=
+          tags: |
+            type=raw,value=main,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ inputs.alternate-latest-mode && endsWith(github.ref, github.event.repository.default_branch) }}
+            type=raw,value=${{ inputs.additional-tag }},enable=${{ inputs.additional-tag != '' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=long
+
+      - name: Build/Push image
+        id: image-push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.docker-context }}
+          file: ${{ inputs.dockerfile }}
+          push: ${{ inputs.push }}
+          platforms: ${{ matrix.platform }}
+          build-args: ${{ inputs.build-args }}
+          tags: |
+            ${{ env.DOCKER_IMAGE_TAGS }}
+
+        tags: ${{ steps.meta.outputs.tags }}
+
+
+      - name: Export image digest
+        if: steps.image-push.outcome == 'success'
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.image-push.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload image digest to artifacts
+        if: steps.image-push.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-linux-${{ env.DOCKER_IMAGE_PLATFORM_SANITIZED }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+
+  # Merges image manifests to multi-arch
+  docker_merge:
+    needs: docker
+    name: Merge images to single manifest
+    runs-on: ubuntu-latest
+    env:
+      DOCKER_IMAGE_NAME: ${{ needs.docker.outputs.DOCKER_IMAGE_NAME }}
+      DOCKER_IMAGE_MERGE_TAGS: ${{ needs.docker.outputs.DOCKER_IMAGE_MERGE_TAGS }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Download image digests
+        uses: actions/download-artifact@v5
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Setup buildx
+        uses: docker/setup-buildx-action@v3.11.1
+
+      - name: Setup docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ env.DOCKER_IMAGE_NAME }}
+          tags: |
+            ${{ env.DOCKER_IMAGE_MERGE_TAGS }}
+
+      - name: Create and push manifest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'docker.io/${{ env.DOCKER_IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: Inspect manifest
+        run: |
+          docker buildx imagetools inspect ghcr.io/${{ env.DOCKER_IMAGE_NAME }}:${{ steps.meta.outputs.version }}
